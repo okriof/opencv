@@ -379,7 +379,6 @@ BRISK_Impl::generateKernel(const std::vector<float> &radiusList,
   }
   // set up the patterns
   patternPoints_ = new BriskPatternPoint[points_ * scales_ * n_rot_];
-  BriskPatternPoint* patternIterator = patternPoints_;
 
   // define the scale discretization:
   static const float lb_scale = (float)(std::log(scalerange_) / std::log(2.0));
@@ -390,47 +389,84 @@ BRISK_Impl::generateKernel(const std::vector<float> &radiusList,
 
   const float sigma_scale = 1.3f;
 
+  // Original loop order was scale, rot, ring, num, but that did a whole lot of
+  // unneccessary recalculations. Instead move the loop over rot innermost.
+  // Beware of the strange handling of iterators (pointers) to patternPoints_
+  // that is required now to get the entry order same as before the loop rearrangement.
+  // Typical values are 64 scales, 1024 rotations, 5 rings and 1 to 20 entires per ring.
+
+  // Create lookup tables for trigonometric functions
+  // and precompute common conversion factors
+  // Lookups are divided into a multiple of n_rot_ entries, such that rot++
+  // can be handled just by looking at a fixed number of entries ahead.
+  const size_t lutEntries = n_rot_ * 2; // Should be an integer multiple of n_rot_
+  float lookupCos[lutEntries];
+  float lookupSin[lutEntries];
+  const double thFactor = 2 * CV_PI / double(lutEntries);
+  for (size_t th = 0; th < lutEntries; ++th)
+  {
+    const double theta = double(th) * thFactor; // this is the rotation of the feature
+    lookupCos[th] = (float)cos(theta);
+    lookupSin[th] = (float)sin(theta);
+  }
+  double* lookupSinPiOverNumberListEntries = new double[rings];
+  for (int ring = 0; ring < rings; ++ring)
+  {
+    lookupSinPiOverNumberListEntries[ring] = sin(CV_PI / numberList[ring]);
+  }
+
   for (unsigned int scale = 0; scale < scales_; ++scale)
   {
     scaleList_[scale] = (float)std::pow((double) 2.0, (double) (scale * lb_scale_step));
     sizeList_[scale] = 0;
+    BriskPatternPoint* patternIteratorOuter = patternPoints_ + (scale * n_rot_ * points_);
 
     // generate the pattern points look-up
-    double alpha, theta;
-    for (size_t rot = 0; rot < n_rot_; ++rot)
+    for (int ring = 0; ring < rings; ++ring)
     {
-      theta = double(rot) * 2 * CV_PI / double(n_rot_); // this is the rotation of the feature
-      for (int ring = 0; ring < rings; ++ring)
-      {
-        for (int num = 0; num < numberList[ring]; ++num)
-        {
-          // the actual coordinates on the circle
-          alpha = (double(num)) * 2 * CV_PI / double(numberList[ring]);
-          patternIterator->x = (float)(scaleList_[scale] * radiusList[ring] * cos(alpha + theta)); // feature rotation plus angle of the point
-          patternIterator->y = (float)(scaleList_[scale] * radiusList[ring] * sin(alpha + theta));
-          // and the gaussian kernel sigma
-          if (ring == 0)
-          {
-            patternIterator->sigma = sigma_scale * scaleList_[scale] * 0.5f;
-          }
-          else
-          {
-            patternIterator->sigma = (float)(sigma_scale * scaleList_[scale] * (double(radiusList[ring]))
-                                     * sin(CV_PI / numberList[ring]));
-          }
-          // adapt the sizeList if necessary
-          const unsigned int size = cvCeil(((scaleList_[scale] * radiusList[ring]) + patternIterator->sigma)) + 1;
-          if (sizeList_[scale] < size)
-          {
-            sizeList_[scale] = size;
-          }
+      const double numToAlphaEntry = double(lutEntries) / double(numberList[ring]);
+      const double scaleRadiusFactor = scaleList_[scale] * radiusList[ring];
 
-          // increment the iterator
-          ++patternIterator;
+      float patternSigma = 0.0f;
+      // and the gaussian kernel sigma
+      if (ring == 0)
+      {
+        patternSigma = sigma_scale * scaleList_[scale] * 0.5f;
+      }
+      else
+      {
+        patternSigma = (float)(sigma_scale * scaleList_[scale] * (double(radiusList[ring]))
+          * lookupSinPiOverNumberListEntries[ring]);
+      }
+      // adapt the sizeList if necessary
+      const unsigned int size = cvCeil(((scaleList_[scale] * radiusList[ring]) + patternSigma)) + 1;
+      if (sizeList_[scale] < size)
+      {
+        sizeList_[scale] = size;
+      }
+
+      for (int num = 0; num < numberList[ring]; ++num)
+      {
+        BriskPatternPoint* patternIterator = patternIteratorOuter;
+        // Original: const double alpha = (double(num)) * 2 * CV_PI / double(numberList[ring]);
+        const unsigned int alphaEntry = static_cast<unsigned int>(num * numToAlphaEntry + 0.5); // (alpha / (2 * CV_PI)) * lutEntries + 0.5
+        for (size_t rot = 0; rot < n_rot_; ++rot)
+        {
+          // Original (rotation of feature): const double theta = double(rot) * 2 * CV_PI / double(n_rot_);
+          // the actual coordinates on the circle, now indexed directly by rot
+          const unsigned int alphathetaEntry = (alphaEntry + rot*(lutEntries/n_rot_)) % lutEntries; // lutEntries should be an integer multiple of n_rot_
+          patternIterator->x = (float)(scaleRadiusFactor * lookupCos[alphathetaEntry]); // feature rotation plus angle of the point
+          patternIterator->y = (float)(scaleRadiusFactor * lookupSin[alphathetaEntry]);
+          patternIterator->sigma = patternSigma;
+
+          patternIterator += points_; // Jump sum of numberList entries ahead since the loops are reordered.
         }
+        // increment the iterator
+        ++patternIteratorOuter;
       }
     }
   }
+  delete[] lookupSinPiOverNumberListEntries;
 
   // now also generate pairings
   shortPairs_ = new BriskShortPair[points_ * (points_ - 1) / 2];
